@@ -3,23 +3,19 @@ import { JobQueueOptions, Job } from "./types";
 export class JobQueue {
   private queue: Job<any>[] = []; // Queue to hold pending jobs
   private activeCount = 0; // Number of currently active jobs
-  private tokens: number; // Rate-limiting token bucket
-  private lastRefillTime: number; // Last time tokens were refilled
   private disposed = false; // Flag to check if queue has been disposed
+
   private readonly concurrencyLimit: number; // Maximum concurrent jobs
   private readonly rateLimit: number; // Rate limit (jobs per minute)
   private readonly timeoutLimit: number; // Timeout per job in seconds
-  private readonly refillRate: number; // Rate of token refill per ms
+
+  private currentWindowStart: number = Date.now(); // Timestamp when the current 60s window started
+  private jobsStartedInWindow = 0; // Count of jobs started in the current window
 
   constructor(options?: JobQueueOptions) {
     this.concurrencyLimit = options?.concurrencyLimit ?? 1000;
     this.rateLimit = options?.rateLimit ?? Infinity;
     this.timeoutLimit = options?.timeoutLimit ?? 1200;
-
-    // Rate limiting setup
-    this.tokens = this.rateLimit;
-    this.refillRate = this.rateLimit / (60 * 1000); // tokens per ms
-    this.lastRefillTime = Date.now();
   }
 
   // Schedule a job to be executed
@@ -60,86 +56,78 @@ export class JobQueue {
     this.queue = [];
   }
 
-  // Refill tokens based on elapsed time
-  private refillTokens(): void {
-    const now = Date.now();
-    const elapsed = now - this.lastRefillTime;
-    const tokensToAdd = elapsed * this.refillRate;
-
-    this.tokens = Math.min(this.rateLimit, this.tokens + tokensToAdd);
-    this.lastRefillTime = now;
-  }
-
   // Check if a job can be run
   private canRunJob(): boolean {
     if (this.disposed || this.activeCount >= this.concurrencyLimit)
       return false;
 
-    if (this.rateLimit === Infinity) return true;
+    const now = Date.now();
 
-    this.refillTokens();
-    return this.tokens >= 1;
+    // If 60 seconds have passed, reset the rate window
+    if (now - this.currentWindowStart >= 60000) {
+      // New time window
+      this.currentWindowStart = now;
+      this.jobsStartedInWindow = 0;
+    }
+
+    return this.rateLimit === Infinity || this.jobsStartedInWindow < this.rateLimit;
   }
 
   // Process jobs in the queue
   private async processQueue(): Promise<void> {
-    if (!this.canRunJob() || this.queue.length === 0) return;
+    // Process as many jobs as allowed under current constraints
+    while (this.canRunJob() && this.queue.length > 0) {
+      const job = this.queue.shift();
+      if (!job) continue;
 
-    const job = this.queue.shift();
-    if (!job) return;
+      this.jobsStartedInWindow++; // Track this job in current rate window
+      this.activeCount++;
+      const startTime = Date.now();
+      const queueTime = startTime - job.enqueueTime;
 
-    // Consume one token for rate limiting
-    if (this.rateLimit !== Infinity) this.tokens -= 1;
+      try {
+        let timeoutId: NodeJS.Timeout | null = null;
+        let timeoutPromise: Promise<never> | null = null;
 
-    this.activeCount++;
-    const startTime = Date.now();
-    const queueTime = startTime - job.enqueueTime;
+        // Create a timeout promise if timeout limit is set
+        if (this.timeoutLimit !== Infinity) {
+          timeoutPromise = new Promise<never>((_, reject) => {
+            timeoutId = setTimeout(() => {
+              reject(
+                new Error(`Job timed out after ${this.timeoutLimit} seconds`)
+              );
+            }, this.timeoutLimit * 1000);
+          });
+        }
+        
+        // Run the job with timeout enforcement if needed
+        const result = await (timeoutPromise
+          ? Promise.race([job.fn(...job.args), timeoutPromise])
+          : job.fn(...job.args));
 
-    try {
-      let timeoutId: NodeJS.Timeout | null = null;
-      let timeoutPromise: Promise<never> | null = null;
+        if (timeoutId) clearTimeout(timeoutId);
 
-      if (this.timeoutLimit !== Infinity) {
-        timeoutPromise = new Promise<never>((_, reject) => {
-          timeoutId = setTimeout(() => {
-            reject(
-              new Error(`Job timed out after ${this.timeoutLimit} seconds`)
-            );
-          }, this.timeoutLimit * 1000);
-        });
+        const executionTime = Date.now() - startTime;
+        job.resolve({ result, queueTime, executionTime });
+      } catch (error) {
+        job.reject(error);
+      } finally {
+        this.activeCount--;
+
+        // Let next jobs try to process
+        setImmediate(() => this.processQueue());
       }
+    }
 
-      // Execute the job with potential timeout
-      const result = await (timeoutPromise
-        ? Promise.race([job.fn(...job.args), timeoutPromise])
-        : job.fn(...job.args));
-
-      if (timeoutId) {
-        clearTimeout(timeoutId);
-      }
-
-      const executionTime = Date.now() - startTime;
-      job.resolve({
-        result,
-        queueTime,
-        executionTime,
-      });
-    } catch (error) {
-      job.reject(error);
-    } finally {
-      this.activeCount--;
-
-      // Schedule next job processing
-      setImmediate(() => this.processQueue());
-
-      if (
-        this.queue.length > 0 &&
-        this.rateLimit !== Infinity &&
-        this.tokens < 1
-      ) {
-        const timeToNextToken = Math.ceil((1 - this.tokens) / this.refillRate);
-        setTimeout(() => this.processQueue(), timeToNextToken);
-      }
+    // If rate limit reached, retry after the window resets
+    if (
+      this.queue.length > 0 &&
+      this.rateLimit !== Infinity &&
+      this.jobsStartedInWindow >= this.rateLimit
+    ) {
+      const now = Date.now();
+      const timeUntilNextWindow = this.currentWindowStart + 60000 - now;
+      setTimeout(() => this.processQueue(), timeUntilNextWindow);
     }
   }
 }
